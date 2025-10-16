@@ -18,7 +18,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -184,8 +184,8 @@ class CustomAllreduce:
             # 8*world_size bytes where world_size is at most 8. Allocating 8MB
             # is enough for 131072 such tuples. The largest model I've seen only
             # needs less than 10000 of registered tuples.
-            self.rank_data = torch.zeros(
-                8 * 1024 * 1024, dtype=torch.uint8, device=self.device
+            self.rank_data = torch.empty(
+                max_size, dtype=torch.uint8, device=self.device
             )
             self._ptr = ops.init_custom_ar(
                 self.meta_ptrs, self.rank_data, rank, self.full_nvlink
@@ -194,15 +194,15 @@ class CustomAllreduce:
         else:
             # meta data buffers need to be "uncached" for signal on MI200
             self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
-            self.buffer = torch.zeros(max_size, dtype=torch.uint8, device=self.device)
+            self.buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
             handle = ops.get_meta_buffer_ipc_handle(self.meta)
             shard_data = (
                 bytes(handle),  # ipc handle to base ptr
                 0,  # offset of base ptr
             )
             handles, offsets = self._gather_ipc_meta(shard_data)
-            self.rank_data = torch.zeros(
-                8 * 1024 * 1024, dtype=torch.uint8, device=self.device
+            self.rank_data = torch.empty(
+                max_size, dtype=torch.uint8, device=self.device
             )
             self._ptr = ops.init_custom_ar(
                 self.meta, self.rank_data, handles, offsets, rank, self.full_nvlink
@@ -301,11 +301,11 @@ class CustomAllreduce:
         if _is_hip:
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
             handles, offsets = self._gather_ipc_meta((bytes(handle), offset))
-            logger.info("Registering %d cuda graph addresses", len(offset))
+            log_info_on_rank0(logger, f"Registering {len(offset)} cuda graph addresses")
             ops.register_graph_buffers(self._ptr, handles, offsets)
         else:
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
-            logger.info("Registering %d cuda graph addresses", len(offset))
+            log_info_on_rank0(logger, f"Registering {len(offset)} cuda graph addresses")
             # We cannot directly use `dist.all_gather_object` here
             # because it is incompatible with `gloo` backend under inference mode.
             # see https://github.com/pytorch/pytorch/issues/126032 for details.
@@ -350,14 +350,14 @@ class CustomAllreduce:
     # or, in the context of cuda graphs, register_graph_buffers
     def all_reduce_reg(self, inp: torch.Tensor, out: torch.Tensor = None):
         if out is None:
-            out = torch.zeros_like(inp)
+            out = torch.empty_like(inp)
         ops.all_reduce_reg(self._ptr, inp, out)
         return out
 
     # all reduce, assuming inp tensor is NOT IPC registered
     def all_reduce_unreg(self, inp: torch.Tensor, out: torch.Tensor = None):
         if out is None:
-            out = torch.zeros_like(inp)
+            out = torch.empty_like(inp)
         ops.all_reduce_unreg(self._ptr, inp, self.buffer, out)
         return out
 
@@ -375,7 +375,7 @@ class CustomAllreduce:
         buffer.
         """
         if out is None:
-            out = torch.zeros_like(inp)
+            out = torch.empty_like(inp)
         if registered:
             ops.all_reduce(self._ptr, inp, out, 0, 0)
         else:
